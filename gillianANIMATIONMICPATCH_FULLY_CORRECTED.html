@@ -285,7 +285,7 @@ body{
   transition:opacity 0.4s ease;
   pointer-events:all;
 }
-#weather-pill.hidden,#loc-pill.hidden{opacity:0;pointer-events:none;}
+#weather-pill.hidden,#loc-pill.hidden,#datetime-pill.hidden{opacity:0;pointer-events:none;}
 #ndi-privacy-pill{cursor:pointer;user-select:none;}
 #ndi-privacy-pill.active{border-color:rgba(167,139,250,0.7);background:rgba(167,139,250,0.2);color:rgba(216,180,254,1);opacity:1;}
 #cal-nav{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;}
@@ -379,10 +379,11 @@ body{
     <div id="loc-pill" class="info-pill">📍 LOCATING...</div>
   </div>
   <div id="weather-pill" class="info-pill hidden">⛅ --°F</div>
+  <div id="datetime-pill" class="info-pill">🕒 --</div>
   <div id="ndi-privacy-pill" class="info-pill" onclick="toggleGlobalPrivacy()" title="Toggle privacy mode">🔓 PRIVACY OFF</div>
 </div>
-<div id="speech-output" role="status" aria-live="polite" aria-atomic="true">
-  <div id="gillian-text"></div>
+<div id="speech-output">
+  <div id="gillian-text" aria-live="polite" aria-atomic="true"></div>
   <div id="user-text"></div>
 </div>
 <input type="file" id="camera-input" accept="image/*" capture="environment" style="display:none;">
@@ -401,7 +402,7 @@ body{
     <div id="vision-preview-container">
       <img id="vision-preview-img" src="" alt="vision target">
       <span id="vision-preview-text">VISION TARGET ACQUIRED</span>
-      <button id="vision-clear" onclick="clearVisionTarget()" type="button">✕</button>
+      <button id="vision-clear" onclick="clearVisionTarget()" type="button" aria-label="Clear vision target">✕</button>
     </div>
     <div id="mic-label">TAP ORB TO START LISTENING</div>
     <div id="nav-pills">
@@ -438,11 +439,11 @@ body{
     </div>
     <div id="input-row">
       <input id="text-input" type="text" placeholder="Type to Gillian..." autocomplete="off">
-      <button id="send-btn" type="button"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg></button>
+      <button id="send-btn" type="button" aria-label="Send message"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg></button>
     </div>
   </div>
 </div>
-<div id="toast"></div>
+<div id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 <div class="panel" id="dashboard-panel"><div class="panel-header"><button class="back-btn" onclick="closePanel('dashboard')" type="button">← BACK</button><span class="panel-title">DASHBOARD</span></div><div class="panel-body" id="dashboard-content"></div></div>
 <div class="panel" id="tasks-panel"><div class="panel-header"><button class="back-btn" onclick="closePanel('tasks')" type="button">← BACK</button><span class="panel-title">TASKS</span></div><div class="panel-body" id="tasks-content"></div></div>
 <div class="panel" id="profile-panel"><div class="panel-header"><button class="back-btn" onclick="closePanel('profile')" type="button">← BACK</button><span class="panel-title">PROFILE</span></div><div class="panel-body" id="profile-content"></div></div>
@@ -526,6 +527,7 @@ function _sanitizeOutput(text){
   t=t.replace(/\b(I am|I'm)\s+a\s+(large language model|language model|AI model|AI assistant)\b/gi,'I\'m Gillian');
   // Layer 4: "powered by" attribution
   t=t.replace(/powered by\s+(Google|OpenAI|Anthropic|Meta|Mistral)/gi,'');
+  t=t.replace(/\s{2,}/g,' ').trim();
   return t;
 }
 
@@ -608,7 +610,7 @@ const TRM={
 let orbState='idle',typingMode=false,speechSynthRunning=false;
 let taskPendingConfirm=null,pendingVisionTarget=null;
 let _inputHandling=false,_currentClassification=null;
-let gcalToken=null,_weatherInterval=null,geoWatchId=null;
+let gcalToken=null,_weatherInterval=null,geoWatchId=null,_timePillInterval=null;
 let activeModel='gemini-2.5-flash';
 const GEMINI_MODELS=['gemini-2.5-flash','gemini-2.5-flash-lite','gemini-flash-latest','gemini-2.0-flash','gemini-2.0-flash-lite'];
 let _speakQueue=[],_speakBusy=false;
@@ -963,12 +965,20 @@ function normalizeMemoryShape(){
   scheduledAlarms.forEach(a=>{if(a.id!==undefined&&a.id!==null)a.id=String(a.id);});
 }
 
+function updateDateTimePill(){
+  const el=document.getElementById('datetime-pill');if(!el)return;
+  const now=new Date();
+  const day=now.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'});
+  const time=now.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'});
+  el.textContent=`🕒 ${day} · ${time}`;
+}
 async function bootGillian(){
   const steps=[],fail=(step,err)=>{const m=step+': '+(err?.message||String(err));steps.push('❌ '+m);console.error(m,err);const el=document.getElementById('boot-error');if(el){el.style.display='block';el.textContent=steps.join('\n');}},ok=s=>{steps.push('✓ '+s);console.log('✓',s);};
   try{
     if(config._geminiModel)delete config._geminiModel;activeModel='gemini-2.5-flash';ok('model set');
     if(!memory.psychProfile?.name)memory.psychProfile={name:config.name||'',stated_about:config.about||'',traits_observed:[],goals_stated:[],patterns_negative:[],patterns_positive:[],strengths:[],avoidances:[],challenges:[],harm_reduction:[],last_updated:new Date().toISOString()};
     memory.sessionCount=(memory.sessionCount||0)+1;memory.lastSeen=new Date().toISOString();save();ok('memory session #'+memory.sessionCount);
+    try{updateDateTimePill();if(_timePillInterval)clearInterval(_timePillInterval);_timePillInterval=setInterval(updateDateTimePill,1000);ok('datetime pill');}catch(e){fail('datetime pill',e);}
     try{setOrbState('thinking');}catch(e){fail('orb',e);}
     try{generateRecurringEvents();ok('recurring');}catch(e){fail('recurring',e);}
     // Defer geo+weather until after first user interaction to avoid stacked permission prompts
@@ -1415,7 +1425,7 @@ function initWakeWord(SR){
           const txt=e.results[i][0].transcript.toLowerCase().trim();
           if(txt.includes('gillian')||txt.includes('jillian')||txt.includes('julian')){
             stopWake();showToast('Yes?',1200);
-            setTimeout(()=>{if(window._startRec){micSessionActive=true;window._startRec();}},500);return;
+            setTimeout(()=>{if(window._startRec){micSessionActive=true;++_recScheduleToken;window._startRec();}},500);return;
           }
         }
       };
@@ -1724,7 +1734,7 @@ function buildLiveStateLayer(name){
   const doneTasks=memory.tasks.filter(t=>t.done&&t.completed&&(now-new Date(t.completed))<86400000);
   const overdue=activeTasks.filter(t=>t.deadline&&new Date(t.deadline)<now);
   const todayStr=toDateStr(now);
-  const todayEvts=(memory.events||[]).filter(e=>e.start.startsWith(todayStr)&&new Date(e.start)>=now).sort((a,b)=>new Date(a.start)-new Date(b.start));
+  const todayEvts=(memory.events||[]).filter(e=>hasEventStartOnDay(e,todayStr)&&new Date(e.start)>=now).sort((a,b)=>new Date(a.start)-new Date(b.start));
   const battery=window._batteryLevel!=null?`${Math.round(window._batteryLevel*100)}%${window._batteryCharging?' (charging)':''}`:'unknown';
   const loc=currentLocation?.label||'unknown';
   const locStale=currentLocation?.ts&&(Date.now()-currentLocation.ts)>30*60*1000;
@@ -2664,7 +2674,7 @@ async function triggerWakeUpSequence(){
   const name=getUserRef();
   const now=new Date(),h=now.getHours(),m=now.getMinutes();
   const open=memory.tasks.filter(t=>!t.done);
-  const todayStr=toDateStr(now),todayEvts=(memory.events||[]).filter(e=>e.start.startsWith(todayStr)).sort((a,b)=>new Date(a.start)-new Date(b.start));
+  const todayStr=toDateStr(now),todayEvts=(memory.events||[]).filter(e=>hasEventStartOnDay(e,todayStr)).sort((a,b)=>new Date(a.start)-new Date(b.start));
   const prompt=`Gillian. It is ${h}:${String(m).padStart(2,'0')} — wake-up time for ${name}. ${open.length} tasks open. Today: ${todayEvts.length>0?todayEvts.map(e=>new Date(e.start).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'})+' '+e.title).join(', '):'nothing scheduled'}.
 Issue a wake-up nudge. Brief, warm, alive. Let them know you're here and waiting for them to engage. Tell them to say hello or tap the orb when ready. 2 sentences max.\nCRITICAL: Return valid JSON.`;
   try{setOrbState('thinking');const sys=buildSystemPrompt(null);const msgs2=[{role:'user',content:prompt}];const msg=await callAI(msgs2,sys);const clean=await processCognitiveState(msg,msgs2,sys);memory.conversations.push({role:'assistant',content:clean,ts:new Date().toISOString()});save();playAlarmTone('announce');await speak(clean,'gillian');setOrbState('idle');
@@ -2699,7 +2709,7 @@ async function triggerMorningBriefing(){
       const reminders=open.filter(t=>t.isReminder);
       const rolledOver=open.filter(t=>t.rolloverCount>0);
       const blocked=open.filter(t=>t.blockedBy);
-      const todayEvts=(memory.events||[]).filter(e=>e.start.startsWith(todayStr)).sort((a,b)=>new Date(a.start)-new Date(b.start));
+      const todayEvts=(memory.events||[]).filter(e=>hasEventStartOnDay(e,todayStr)).sort((a,b)=>new Date(a.start)-new Date(b.start));
       const imminent=todayEvts.filter(e=>{const d=new Date(e.start);return d>now&&d<new Date(now.getTime()+3*60*60*1000);});
       const lastDebrief=memory.lastNightlyDebrief||{};
       const lastRollover=memory.lastRollover||null;
@@ -2782,8 +2792,8 @@ async function triggerNightlyDebrief(){
   const todayStr=toDateStr(now);
   const tomorrow=new Date(now);tomorrow.setDate(tomorrow.getDate()+1);
   const tomStr=toDateStr(tomorrow);
-  const todayEvts=(memory.events||[]).filter(e=>e.start.startsWith(todayStr));
-  const tomEvts=(memory.events||[]).filter(e=>e.start.startsWith(tomStr)).sort((a,b)=>new Date(a.start)-new Date(b.start));
+  const todayEvts=(memory.events||[]).filter(e=>hasEventStartOnDay(e,todayStr));
+  const tomEvts=(memory.events||[]).filter(e=>hasEventStartOnDay(e,tomStr)).sort((a,b)=>new Date(a.start)-new Date(b.start));
   const critTom=tomEvts.find(e=>/meeting|appointment|call|flight|interview|deadline|presentation/i.test(e.title));
   const earlyStart=tomEvts.find(e=>{const h=new Date(e.start).getHours();return h<9;});
   const wakeTime=memory.settings?.wakeTime||'07:00';
@@ -3162,7 +3172,7 @@ function updateDashboard(){
   const el=document.getElementById('dashboard-content');if(!el)return;
   const now=new Date(),todayStr=toDateStr(now);
   const open=memory.tasks.filter(t=>!t.done),overdue=open.filter(t=>t.deadline&&new Date(t.deadline)<now);
-  const todayEvts=(memory.events||[]).filter(e=>e.start.startsWith(todayStr)&&new Date(e.start)>=now).sort((a,b)=>new Date(a.start)-new Date(b.start));
+  const todayEvts=(memory.events||[]).filter(e=>hasEventStartOnDay(e,todayStr)&&new Date(e.start)>=now).sort((a,b)=>new Date(a.start)-new Date(b.start));
   const f=memory.finances||{};
   const acctTotal=(f.accounts||[]).reduce((s,a)=>{const n=parseFloat(String(a.amount).replace(/[$,]/g,''));return s+(isNaN(n)?0:n);},0);
   const debtTotal=(f.debts||[]).reduce((s,a)=>{const n=parseFloat(String(a.amount).replace(/[$,]/g,''));return s+(isNaN(n)?0:n);},0);
@@ -3317,6 +3327,12 @@ function updateHistoryUI(){
 }
 
 
+// ── CALENDAR UTILITIES ────────────────────────────────────────────
+function hasEventStartOnDay(evt,dayStr){
+  if(!evt||typeof evt.start!=='string'||!dayStr)return false;
+  try{return evt.start.startsWith(dayStr);}catch(e){return false;}
+}
+
 // ── CALENDAR SAVE REPAIR ─────────────────────────────────────────
 // Guarantees calendar writes have a real events array, a valid local start time,
 // and a visible success/failure result. Used by manual form, AI actions, and
@@ -3424,12 +3440,12 @@ function renderCalendar(selectedDate=null){
   for(let i=0;i<startDow;i++){const d=new Date(y,mo,1-startDow+i);html+=`<div class="cal-day other-month" onclick="calSelectDate('${toDateStr(d)}')"><span class="cal-day-num">${d.getDate()}</span></div>`;}
   for(let d=1;d<=days;d++){
     const date=new Date(y,mo,d);const ds=toDateStr(date);const isToday=ds===toDateStr(now);const isSel=selectedDate&&ds===selectedDate;
-    const hasEvts=(memory.events||[]).some(e=>e.start.startsWith(ds));
+    const hasEvts=(memory.events||[]).some(e=>hasEventStartOnDay(e,ds));
     html+=`<div class="cal-day${isToday?' today':''}${isSel?' selected':''}${hasEvts?' has-events':''}" onclick="calSelectDate('${ds}')"><span class="cal-day-num">${d}</span></div>`;
   }
   html+=`</div>`;
   const dispDate=selectedDate||toDateStr(now);
-  const dayEvts=(memory.events||[]).filter(e=>e.start.startsWith(dispDate)).sort((a,b)=>new Date(a.start)-new Date(b.start));
+  const dayEvts=(memory.events||[]).filter(e=>hasEventStartOnDay(e,dispDate)).sort((a,b)=>new Date(a.start)-new Date(b.start));
   html+=`<div class="cal-events-section"><div class="cal-events-title">${new Date(dispDate+'T12:00:00').toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric'}).toUpperCase()} — ${dayEvts.length} EVENT${dayEvts.length!==1?'S':''}</div>`;
   if(dayEvts.length>0){dayEvts.forEach(e=>{html+=`<div class="cal-event-item"><div class="cal-event-time">${new Date(e.start).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'})}</div><div style="flex:1"><div class="cal-event-title">${esc(e.title)}</div>${e.notes?`<div class="cal-event-notes">${esc(e.notes)}</div>`:''}</div><button class="cal-event-delete" onclick="deleteCalEvent('${e.id}')" type="button">×</button></div>`;});}
   else html+=`<div style="text-align:center;padding:24px;font-family:var(--font-mono);font-size:11px;color:rgba(165,180,252,0.75)">CLEAR DAY — tap + ADD or tell Gillian to schedule something</div>`;
@@ -3442,8 +3458,10 @@ function deleteCalEvent(id){const _eid=String(id);memory.events=(memory.events||
 function showAddEventForm(prefillDate=null){const f=document.getElementById('add-event-form');f.classList.add('open');const today=prefillDate||toDateStr(new Date());document.getElementById('aef-date').value=today;document.getElementById('aef-time').value='09:00';}
 function hideAddEventForm(){document.getElementById('add-event-form').classList.remove('open');}
 function saveEventForm(){
-  const title=document.getElementById('aef-title').value.trim(),date=document.getElementById('aef-date').value,time=document.getElementById('aef-time').value,dur=parseInt(document.getElementById('aef-dur').value)||60,notes=document.getElementById('aef-notes').value.trim();
-  if(!title||!date){showToast('Title and date required.');return;}
+  const title=document.getElementById('aef-title').value.trim(),date=document.getElementById('aef-date').value,time=document.getElementById('aef-time').value,notes=document.getElementById('aef-notes').value.trim();
+  const rawDur=parseInt(document.getElementById('aef-dur').value,10);
+  const dur=Number.isFinite(rawDur)?Math.max(5,Math.min(rawDur,480)):60;
+  if(!title||!date||!time){showToast('Title, date, and time are required.');return;}
   const start=resolveCalendarStartAt(null,date,time);
   const res=commitCalendarEvent(title,start,dur,notes,{source:'manual'});
   if(!res.ok){showToast(res.reason==='invalid-date'?'Invalid date/time.':'Title and date required.');return;}
@@ -3458,7 +3476,7 @@ function dayPlannerAddEvent(){if(_dpDate)showAddEventForm(_dpDate);}
 function renderDayPlanner(){
   const el=document.getElementById('day-planner-body'),lbl=document.getElementById('day-planner-date-label');if(!el||!lbl||!_dpDate)return;
   lbl.textContent=new Date(_dpDate+'T12:00:00').toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric'}).toUpperCase();
-  const evts=(memory.events||[]).filter(e=>e.start.startsWith(_dpDate));let html='';
+  const evts=(memory.events||[]).filter(e=>hasEventStartOnDay(e,_dpDate));let html='';
   for(let h=0;h<=23;h++){
     const hStr=String(h).padStart(2,'0')+':00';const label=new Date(2000,0,1,h).toLocaleTimeString('en-US',{hour:'numeric',hour12:true}).replace(' ','');
     const hourEvts=evts.filter(e=>{const eh=new Date(e.start).getHours();return eh===h;});

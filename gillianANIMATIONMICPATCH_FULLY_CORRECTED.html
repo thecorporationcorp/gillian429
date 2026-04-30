@@ -381,7 +381,7 @@ body{
   <div id="weather-pill" class="info-pill hidden">⛅ --°F</div>
   <div id="ndi-privacy-pill" class="info-pill" onclick="toggleGlobalPrivacy()" title="Toggle privacy mode">🔓 PRIVACY OFF</div>
 </div>
-<div id="speech-output">
+<div id="speech-output" role="status" aria-live="polite" aria-atomic="true">
   <div id="gillian-text"></div>
   <div id="user-text"></div>
 </div>
@@ -613,6 +613,8 @@ let activeModel='gemini-2.5-flash';
 const GEMINI_MODELS=['gemini-2.5-flash','gemini-2.5-flash-lite','gemini-flash-latest','gemini-2.0-flash','gemini-2.0-flash-lite'];
 let _speakQueue=[],_speakBusy=false;
 let _speakGeneration=0;
+let _recScheduleToken=0;
+let _lastMicTapTs=0;
 let _mutationLock=false;
 async function withMutationLock(fn){
   if(_mutationLock)return false;
@@ -1344,7 +1346,7 @@ function initVoice(){
     setOrbState('idle');updateMicLabel();
   };
 
-  function _schedRR(ms){if(_recStarting||_recRunning||isSpeakingNow()||!micSessionActive)return;setTimeout(()=>{if(!_recRunning&&!_recStarting&&!isSpeakingNow()&&micSessionActive)_startRec();},ms);}
+  function _schedRR(ms){if(_recStarting||_recRunning||isSpeakingNow()||!micSessionActive)return;const _tok=++_recScheduleToken;setTimeout(()=>{if(_tok!==_recScheduleToken)return;if(!_recRunning&&!_recStarting&&!isSpeakingNow()&&micSessionActive)_startRec();},ms);}
   function _startRec(){
     if(_recRunning||_recStarting)return;if(isSpeakingNow())return;
     if(window._stopWake)window._stopWake();
@@ -1364,12 +1366,12 @@ function initVoice(){
   // ── ORB TAP HANDLER ──────────────────────────────────────────
   const micBtn=document.getElementById('orb-hitbox');
   function handleMicTap(){
+    const _tapTs=Date.now();if(_tapTs-_lastMicTapTs<350)return;_lastMicTapTs=_tapTs;
     // INTERRUPTION: tap during speech
     if(orbState==='speaking'||orbState==='celebrate'||_speakBusy){
       window.speechSynthesis?.cancel();
       if(window._currentAudio){window._currentAudio.pause();window._currentAudio=null;}
-      _speakGeneration++; // invalidate any in-flight drain
-      _speakQueue=[];_speakBusy=false;speechSynthRunning=false;
+      flushSpeakQueue();
       _recMode=REC_MODE.OFF;
       clearTimeout(window._gtft);TRM.transition(RS.INTERRUPTED);setOrbState('interrupted');
       playAlarmTone('notify');showToast('Interrupted. Tap to speak.',1500);
@@ -1463,6 +1465,7 @@ function toggleTyping(){
 function sendText(){const i=document.getElementById('text-input'),v=i.value.trim();if(!v)return;i.value='';TRM.updateUser(v);TRM.fadeUser();if(typingMode)toggleTyping();handleUserInput(v);}
 
 // ── SPEECH QUEUE ─────────────────────────────────────────────────
+function flushSpeakQueue(){_speakGeneration++;_speakQueue=[];_speakBusy=false;speechSynthRunning=false;}
 async function speak(text,role='gillian'){
   if(!text)return;
   const safe=_sanitizeOutput(text);

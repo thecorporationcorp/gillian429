@@ -747,7 +747,7 @@ function assertInvariants(){
   const errs=[];
   for(const t of memory.tasks||[]){
     if(t.done&&(t.nagCount>0||t.lastNagTime||t.announcedDue))errs.push(`done task still naggable: ${t.text?.slice(0,40)}`);
-    if(t.isReminder&&!t.deadline)errs.push(`reminder without deadline: ${t.text?.slice(0,40)}`);
+    if(t.isReminder===true&&!t.deadline)errs.push(`reminder without deadline: ${t.text?.slice(0,40)}`);
     if(t.priority&&!['low','medium','high','critical'].includes(t.priority))errs.push(`bad priority on: ${t.text?.slice(0,40)}`);
     if(t.isReminder!==true&&t.source==='reminder')errs.push(`reminder source not marked isReminder: ${t.text?.slice(0,40)}`);
     if(t.isReminder===true&&t.source!=='reminder')errs.push(`isReminder set but source not 'reminder': ${t.text?.slice(0,40)}`);
@@ -763,7 +763,8 @@ function save(){
   if(_saveLock)return;
   _saveLock=true;
   try{
-    const errs=assertInvariants();
+    let errs=assertInvariants();
+    if(errs.length){normalizeMemoryShape();errs=assertInvariants();}
     if(errs.length){
       console.error('[InvariantViolation]',errs);
       _G.log('INVARIANT','FAIL',errs);
@@ -772,6 +773,7 @@ function save(){
       _saveLock=false;
       return;
     }
+    try{_reconcileLedger();}catch(_re){}
     localStorage.setItem(DB_KEY,JSON.stringify({config,memory,scheduledAlarms,schemaVersion:SCHEMA_VERSION}));
   }catch(e){
     if(e.name==='QuotaExceededError'||e.code===22){
@@ -868,6 +870,7 @@ window.addEventListener('DOMContentLoaded',()=>{
     const _evtRetainCutoff=now-90*24*60*60*1000;
     memory.events=(memory.events||[]).filter(e=>e.start&&new Date(e.start).getTime()>_evtRetainCutoff);
     if(!memory.journal)memory.journal=[];
+    if(!memory.actionLog)memory.actionLog=[];
     if(!config.apiKey)config.apiKey='';
     _ndiGlobalPrivacy=memory.settings?.privacyMode||false;
     try{const sh=memory.ndiPhraseHistory;if(sh&&typeof sh==='object'){const ids=new Set((memory.tasks||[]).map(t=>String(t.id)));_ndiPhraseHistory=Object.fromEntries(Object.entries(sh).filter(([k])=>ids.has(k)));}}catch(e){_ndiPhraseHistory={};}
@@ -881,6 +884,7 @@ window.addEventListener('DOMContentLoaded',()=>{
     }
     save();
     try{rehydrateAlarms();}catch(e){console.warn('[Boot] alarm rehydration:',e);}
+    try{_reconcileLedger();save();}catch(e){console.warn('[Boot] ledger reconcile:',e);}
     if(memory.pendingPrune){setOrbState('alert');document.getElementById('pill-profile').classList.add('alert-orange');}
   }catch(e){console.error('INIT FATAL:',e);const el=document.getElementById('boot-error');if(el){el.style.display='block';el.textContent='INIT FAILED: '+e.message+'\n'+e.stack;}return;}
   showEnterSplash();
@@ -930,6 +934,8 @@ function normalizeMemoryShape(){
       t.announcedDue=false;
     }
 
+    t.isReminder=!!t.isReminder;
+    if(!t.source)t.source='user';
     if(!['low','medium','high','critical'].includes(t.priority))t.priority='medium';
 
     // repair A: reminder bit set but no deadline — cannot be a valid reminder
@@ -972,6 +978,52 @@ function updateDateTimePill(){
   const time=now.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'});
   el.textContent=`🕒 ${day} · ${time}`;
 }
+
+// ── ACTION LEDGER ─────────────────────────────────────────────────
+// Persistent log of every executed action. Reconciled on every save and boot
+// to guarantee tasks/alarms/reminders survive even if normal execution fails.
+function _logAction(type,payload,entityId){
+  if(!memory.actionLog)memory.actionLog=[];
+  memory.actionLog.push({id:genId(),ts:new Date().toISOString(),type,payload,entityId:String(entityId||''),status:'LOGGED'});
+  if(memory.actionLog.length>600)memory.actionLog=memory.actionLog.slice(-600);
+}
+
+function _reconcileLedger(){
+  if(!memory.actionLog?.length)return;
+  const taskIds=new Set((memory.tasks||[]).map(t=>t.id));
+  const alarmIds=new Set((scheduledAlarms||[]).map(a=>String(a.id)));
+  let restored=0;
+  for(const entry of memory.actionLog){
+    if(entry.status==='VERIFIED')continue;
+    const ageDays=(Date.now()-new Date(entry.ts).getTime())/(86400000);
+    if(ageDays>30){entry.status='VERIFIED';continue;}
+    if((entry.type==='ADD_TASK'||entry.type==='ADD_REMINDER')&&entry.entityId){
+      if(!taskIds.has(entry.entityId)){
+        const p=entry.payload||{};
+        const alreadyByText=(memory.tasks||[]).some(t=>!t.done&&p.text&&t.text.toLowerCase()===p.text.toLowerCase());
+        if(p.text&&!alreadyByText&&ageDays<7){
+          const nt={id:entry.entityId,text:p.text,done:false,priority:p.priority||'medium',created:entry.ts,deadline:p.deadline||null,blockedBy:null,updates:[],private:!!p.private,isNDIPriority:false,isReminder:!!p.isReminder,source:p.isReminder?'reminder':'user',nagCount:0,lastNagTime:null,rolloverCount:0};
+          (memory.tasks=memory.tasks||[]).push(nt);
+          taskIds.add(nt.id);
+          restored++;
+          _G.log('LEDGER','TASK_RESTORED',p.text?.slice(0,40));
+        }
+      } else {entry.status='VERIFIED';}
+    } else if(entry.type==='SCHEDULE_ALARM'&&entry.entityId){
+      if(!alarmIds.has(entry.entityId)){
+        const p=entry.payload||{};
+        if(p.alarmAt){
+          const now=new Date();const [ah,am]=(p.alarmAt||'').split(':').map(Number);
+          const alarmToday=new Date(now.getFullYear(),now.getMonth(),now.getDate(),ah||0,am||0,0,0);
+          if(alarmToday>now){setAlarm(p.alarmAt,p.label||'Alarm',!!p.isWakeAlarm);restored++;_G.log('LEDGER','ALARM_RESTORED',p.alarmAt);}
+          else{entry.status='VERIFIED';}
+        } else{entry.status='VERIFIED';}
+      } else{entry.status='VERIFIED';}
+    } else{entry.status='VERIFIED';}
+  }
+  if(restored>0)showToast(`⚡ Ledger restored ${restored} item${restored>1?'s':''}.`,4000);
+}
+
 async function bootGillian(){
   const steps=[],fail=(step,err)=>{const m=step+': '+(err?.message||String(err));steps.push('❌ '+m);console.error(m,err);const el=document.getElementById('boot-error');if(el){el.style.display='block';el.textContent=steps.join('\n');}},ok=s=>{steps.push('✓ '+s);console.log('✓',s);};
   try{
@@ -1691,7 +1743,9 @@ FULL ACTION LIST (33 total):
 {"action_type":"CANCEL_ALARM","payload":{"id":"..."}}
 {"action_type":"ADD_CALENDAR_EVENT","payload":{"title":"...","startAt":"ISO","durationMins":60,"notes":"..."}}
 {"action_type":"SYNC_TO_GCAL","payload":{"title":"...","startAt":"ISO","durationMins":60}}
-{"action_type":"ADD_RECURRING_EVENT","payload":{"title":"...","time":"HH:MM","recurrence":"daily|weekdays|weekends|weekly:N|monthly:N","notes":""}}
+{"action_type":"ADD_RECURRING_EVENT","payload":{"title":"...","time":"HH:MM","recurrence":"daily|weekdays|weekends|weekly:N|monthly:N","notes":"","addToTasks":false}}
+// weekly:N day numbers: 0=Sunday 1=Monday 2=Tuesday 3=Wednesday 4=Thursday 5=Friday 6=Saturday. monthly:N = day-of-month.
+// Set addToTasks:true for habits/routines the user needs to check off (exercise, meds, chores, etc.)
 {"action_type":"REMOVE_RECURRING_EVENT","payload":{"titleMatch":"..."}}
 {"action_type":"UPDATE_RECURRING_EVENT","payload":{"titleMatch":"...","field":"time|recurrence|title","value":"..."}}
 {"action_type":"SCHEDULE_DEBRIEF","payload":{"scheduledFor":"...","triggerType":"..."}}
@@ -1936,7 +1990,7 @@ const ACTION_SCHEMAS={
   CANCEL_ALARM:{required:['id']},
   ADD_CALENDAR_EVENT:{required:['title','startAt'],optional:['durationMins','notes'],types:{title:'string',startAt:'string'}},
   SYNC_TO_GCAL:{required:['title','startAt'],optional:['durationMins'],types:{title:'string',startAt:'string'}},
-  ADD_RECURRING_EVENT:{required:['title','time','recurrence'],optional:['notes'],types:{title:'string',time:'string',recurrence:'string'}},
+  ADD_RECURRING_EVENT:{required:['title','time','recurrence'],optional:['notes','addToTasks','durationMins'],types:{title:'string',time:'string',recurrence:'string'}},
   REMOVE_RECURRING_EVENT:{required:['titleMatch'],types:{titleMatch:'string'}},
   UPDATE_RECURRING_EVENT:{required:['titleMatch','field','value'],types:{titleMatch:'string',field:'string',value:'string'},enums:{field:['time','recurrence','title']}},
   SCHEDULE_DEBRIEF:{required:['scheduledFor'],optional:['triggerType'],types:{scheduledFor:'string'}},
@@ -2220,6 +2274,7 @@ async function processCognitiveState(rawJson,msgs,sys){
               if(!isNaN(d.getTime()))nt.deadline=d.toISOString();
             }
             memory.tasks.push(nt);
+            _logAction('ADD_TASK',{text:p.text,priority:nt.priority,deadline:nt.deadline,private:nt.private,isReminder:false},nt.id);
             _taskExecuted=true;
             _executed.push('ADD_TASK');
             const _taskTime=new Date().toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'});
@@ -2228,7 +2283,7 @@ async function processCognitiveState(rawJson,msgs,sys){
           }
         }
         break;
-      case 'ADD_REMINDER':if(p.text&&p.dueAt){const exists=memory.tasks.some(t=>!t.done&&t.text.toLowerCase()===p.text.toLowerCase());if(!exists){const nd=new Date(p.dueAt);if(!isNaN(nd.getTime())){const nt={id:genId(),text:p.text,done:false,priority:'medium',created:new Date().toISOString(),deadline:nd.toISOString(),blockedBy:null,updates:[],private:false,isNDIPriority:false,isReminder:true,source:'reminder',nagCount:0,lastNagTime:null,rolloverCount:0};memory.tasks.push(nt);showToast('Reminder: '+p.text.slice(0,40),5000);_ndiShowTaskToggles(nt.id);}}}break;
+      case 'ADD_REMINDER':if(p.text&&p.dueAt){const exists=memory.tasks.some(t=>!t.done&&t.text.toLowerCase()===p.text.toLowerCase());if(!exists){const nd=new Date(p.dueAt);if(!isNaN(nd.getTime())){const nt={id:genId(),text:p.text,done:false,priority:'medium',created:new Date().toISOString(),deadline:nd.toISOString(),blockedBy:null,updates:[],private:false,isNDIPriority:false,isReminder:true,source:'reminder',nagCount:0,lastNagTime:null,rolloverCount:0};memory.tasks.push(nt);_logAction('ADD_REMINDER',{text:p.text,deadline:nd.toISOString(),isReminder:true},nt.id);showToast('Reminder: '+p.text.slice(0,40),5000);_ndiShowTaskToggles(nt.id);}}}break;
       case 'UPDATE_TASK':if(p.match&&p.newText){const t=memory.tasks.find(t=>!t.done&&t.text.toLowerCase().includes(p.match.toLowerCase()));if(t){t.updates=t.updates||[];t.updates.push({old:t.text,ts:new Date().toISOString()});t.text=p.newText;}}break;
       case 'BLOCK_TASK':if(p.match){const t=memory.tasks.find(t=>!t.done&&t.text.toLowerCase().includes(p.match.toLowerCase()));if(t)t.blockedBy=p.blockedBy;}break;
       case 'PRIORITIZE_TASK':if(p.match){const t=memory.tasks.find(t=>!t.done&&t.text.toLowerCase().includes(p.match.toLowerCase()));if(t)t.priority=p.priority;}break;
@@ -2236,13 +2291,13 @@ async function processCognitiveState(rawJson,msgs,sys){
       case 'COMPLETE_TASK':if(p.id){const t=memory.tasks.find(t=>t.id===String(p.id)&&!t.done);if(t){taskPendingConfirm=t;pendingConfirm=`Mark "${t.text}" as done?`;_completeExecuted=true;}}break;
       case 'DELETE_TASK':if(p.id){const _dtSid=String(p.id);const _dtIdx=memory.tasks.findIndex(t=>String(t.id)===_dtSid);if(_dtIdx!==-1){memory.tasks.splice(_dtIdx,1);if(_ndiPhraseHistory[_dtSid])delete _ndiPhraseHistory[_dtSid];showToast('Task deleted.');}}break;
       case 'TIMER':case 'START_TIMER':if(p.durationSeconds>0){showToast('⏱ '+p.label+' ('+formatDur(p.durationSeconds)+')');startVoiceCountdown(p.durationSeconds,p.label);}break;
-      case 'ALARM':case 'SCHEDULE_ALARM':if(p.alarmAt)setAlarm(p.alarmAt,p.label||'Alarm',p.isWakeAlarm||false);break;
+      case 'ALARM':case 'SCHEDULE_ALARM':if(p.alarmAt){const _alId=genId();setAlarm(p.alarmAt,p.label||'Alarm',p.isWakeAlarm||false);_logAction('SCHEDULE_ALARM',{alarmAt:p.alarmAt,label:p.label||'Alarm',isWakeAlarm:p.isWakeAlarm||false},_alId);}break;
       case 'CANCEL_ALARM':if(p.id){const _cid=String(p.id);if(_alarmTimers[_cid]){clearTimeout(_alarmTimers[_cid]);delete _alarmTimers[_cid];}scheduledAlarms=scheduledAlarms.filter(a=>String(a.id)!==_cid);showToast('Alarm cancelled.');}break;
       case 'ADD_EVENT':case 'ADD_CALENDAR_EVENT':{const s=resolveCalendarStartAt(p.startAt,p.date,p.time);const res=commitCalendarEvent(p.title,s,p.durationMins||60,p.notes||'',{source:'ai'});if(res.ok){_executed.push(type);}else{_rejected.push({type,reason:'CALENDAR_'+res.reason,raw:JSON.stringify(act).slice(0,200)});console.warn('[CalendarTelemetry] ADD_CALENDAR_EVENT failed:',res.reason,p);}}break;
       case 'GCAL':case 'SYNC_TO_GCAL':if(p.title&&p.startAt)addToGoogleCalendar(p.title,p.startAt,p.durationMins||60);break;
-      case 'ADD_RECURRING':case 'ADD_RECURRING_EVENT':if(p.title){memory.recurring=memory.recurring||[];const dup=memory.recurring.find(r=>r.title.toLowerCase()===p.title.toLowerCase()&&r.active!==false);if(!dup){memory.recurring.push({id:genId(),title:p.title,time:p.time||'08:00',recurrence:p.recurrence||'daily',notes:p.notes||'',durationMins:30,active:true,createdTs:new Date().toISOString(),generatedThrough:null});generateRecurringEvents();showToast('🔁 '+p.title);}}break;
+      case 'ADD_RECURRING':case 'ADD_RECURRING_EVENT':if(p.title){memory.recurring=memory.recurring||[];const dup=memory.recurring.find(r=>r.title.toLowerCase()===p.title.toLowerCase()&&r.active!==false);if(!dup){const rid=genId();memory.recurring.push({id:rid,title:p.title,time:p.time||'08:00',recurrence:normalizeRecurrence(p.recurrence||'daily'),notes:p.notes||'',durationMins:p.durationMins||30,addToTasks:!!p.addToTasks,active:true,createdTs:new Date().toISOString(),generatedThrough:null});generateRecurringEvents();_logAction('ADD_RECURRING_EVENT',{title:p.title,time:p.time,recurrence:p.recurrence,addToTasks:!!p.addToTasks},rid);showToast('🔁 '+p.title);}}break;
       case 'REMOVE_RECURRING':case 'REMOVE_RECURRING_EVENT':if(p.titleMatch){memory.recurring=memory.recurring||[];const r=memory.recurring.find(r=>r.title.toLowerCase().includes(p.titleMatch.toLowerCase()));if(r){r.active=false;r.generatedThrough=null;const now=new Date();memory.events=(memory.events||[]).filter(e=>!(e.recurringId===r.id&&new Date(e.start)>=now));showToast('🔁 Removed: '+r.title);}}break;
-      case 'UPDATE_RECURRING':case 'UPDATE_RECURRING_EVENT':if(p.titleMatch&&p.field&&p.value){memory.recurring=memory.recurring||[];const r=memory.recurring.find(r=>r.title.toLowerCase().includes(p.titleMatch.toLowerCase())&&r.active!==false);if(r){const now=new Date();if(p.field==='time'||p.field==='recurrence'){memory.events=(memory.events||[]).filter(e=>!(e.recurringId===r.id&&new Date(e.start)>=now));r.generatedThrough=null;r[p.field]=p.value;}else if(p.field==='title'){(memory.events||[]).filter(e=>e.recurringId===r.id).forEach(e=>{e.title=p.value;});r.title=p.value;}generateRecurringEvents();showToast('🔁 Updated: '+r.title);}}break;
+      case 'UPDATE_RECURRING':case 'UPDATE_RECURRING_EVENT':if(p.titleMatch&&p.field&&p.value){memory.recurring=memory.recurring||[];const r=memory.recurring.find(r=>r.title.toLowerCase().includes(p.titleMatch.toLowerCase())&&r.active!==false);if(r){const now=new Date();if(p.field==='time'||p.field==='recurrence'){memory.events=(memory.events||[]).filter(e=>!(e.recurringId===r.id&&new Date(e.start)>=now));r.generatedThrough=null;r[p.field]=p.field==='recurrence'?normalizeRecurrence(p.value):p.value;}else if(p.field==='title'){(memory.events||[]).filter(e=>e.recurringId===r.id).forEach(e=>{e.title=p.value;});r.title=p.value;}generateRecurringEvents();showToast('🔁 Updated: '+r.title);}}break;
       case 'SCHEDULE_DEBRIEF':break;
       case 'LOG_GILLIAN_OBSERVATION':case 'JOURNAL':case 'ADD_JOURNAL_ENTRY':if(p.content){memory.journal=memory.journal||[];memory.journal.push({id:genId(),ts:new Date().toISOString(),author:type==='ADD_JOURNAL_ENTRY'?'user':'gillian',text:p.content,tags:p.tags||[]});showToast('📓 Logged.');if(document.getElementById('journal-panel').classList.contains('open'))renderJournal();}break;
       case 'LOG_ROUTINE':if(p.name){memory.routines=memory.routines||[];memory.routines.push({name:p.name,time:p.time,description:p.description});showToast('Routine: '+p.name);}break;
@@ -3059,28 +3114,58 @@ function addToGoogleCalendar(title,startAt,durationMins){
 }
 
 // ── RECURRING EVENTS ──────────────────────────────────────────────
+// Normalize recurrence strings: "monday"→"weekly:1", "weekly:monday"→"weekly:1", etc.
+function normalizeRecurrence(rec){
+  if(!rec)return'daily';
+  const r=rec.toLowerCase().trim();
+  const days={sunday:0,monday:1,tuesday:2,wednesday:3,thursday:4,friday:5,saturday:6,sun:0,mon:1,tue:2,wed:3,thu:4,fri:5,sat:6};
+  if(days[r]!==undefined)return`weekly:${days[r]}`;
+  if(r.startsWith('weekly:')){const part=r.split(':')[1]||'';if(days[part]!==undefined)return`weekly:${days[part]}`;const n=parseInt(part);return(n>=0&&n<=6)?`weekly:${n}`:'weekly:1';}
+  if(r==='weekly')return`weekly:1`;
+  if(['daily','weekdays','weekends'].includes(r))return r;
+  if(r.startsWith('monthly:'))return r;
+  return'daily';
+}
+
 function generateRecurringEvents(){
   if(!memory.recurring?.length)return;
-  const now=new Date();const ahead=new Date(now.getTime()+14*24*60*60*1000);
+  const now=new Date();const ahead=new Date(now.getTime()+60*24*60*60*1000);
   memory.recurring.filter(r=>r.active!==false).forEach(r=>{
+    const rec=normalizeRecurrence(r.recurrence);
+    if(r.recurrence!==rec)r.recurrence=rec; // normalize stored value
     const genThru=r.generatedThrough?new Date(r.generatedThrough):now;
     if(genThru>=ahead)return;
-    const [rh,rm]=r.time.split(':').map(Number);
+    const timeParts=(r.time||'08:00').split(':').map(Number);
+    const rh=timeParts[0]||0,rm=timeParts[1]||0;
     let cursor=new Date(Math.max(now.getTime(),genThru.getTime()));cursor.setHours(rh,rm,0,0);
     while(cursor<=ahead){
       const dow=cursor.getDay();let match=false;
-      if(r.recurrence==='daily')match=true;
-      else if(r.recurrence==='weekdays')match=dow>=1&&dow<=5;
-      else if(r.recurrence==='weekends')match=dow===0||dow===6;
-      else if(r.recurrence?.startsWith('weekly:')){const d=parseInt(r.recurrence.split(':')[1]);match=dow===d;}
-      else if(r.recurrence?.startsWith('monthly:')){const day=parseInt(r.recurrence.split(':')[1]);match=cursor.getDate()===day;}
+      if(rec==='daily')match=true;
+      else if(rec==='weekdays')match=dow>=1&&dow<=5;
+      else if(rec==='weekends')match=dow===0||dow===6;
+      else if(rec.startsWith('weekly:')){const d=parseInt(rec.split(':')[1]);match=dow===d;}
+      else if(rec.startsWith('monthly:')){const day=parseInt(rec.split(':')[1]);match=cursor.getDate()===day;}
       if(match&&cursor>now){
         const key=`${r.id}_${toDateStr(cursor)}`;
         const exists=(memory.events||[]).some(e=>
           e.recurringKey===key||
           (e.recurringId===r.id&&e.start===cursor.toISOString()&&e.title===r.title)
         );
-        if(!exists){memory.events.push({id:genId(),title:r.title,start:cursor.toISOString(),end:new Date(cursor.getTime()+(r.durationMins||30)*60000).toISOString(),notes:r.notes||'',recurringId:r.id,recurringKey:key});}
+        if(!exists){
+          const evtId=genId();
+          memory.events.push({id:evtId,title:r.title,start:cursor.toISOString(),end:new Date(cursor.getTime()+(r.durationMins||30)*60000).toISOString(),notes:r.notes||'',recurringId:r.id,recurringKey:key});
+          // Also create a task reminder for this occurrence if addToTasks is set
+          if(r.addToTasks){
+            const taskDeadline=cursor.toISOString();
+            const alreadyHasTask=(memory.tasks||[]).some(t=>!t.done&&t.text.toLowerCase()===r.title.toLowerCase()&&t.deadline===taskDeadline);
+            if(!alreadyHasTask){
+              const nt={id:genId(),text:r.title,done:false,priority:'medium',created:new Date().toISOString(),deadline:taskDeadline,blockedBy:null,updates:[],private:false,isNDIPriority:false,isReminder:true,source:'reminder',nagCount:0,lastNagTime:null,rolloverCount:0};
+              memory.tasks=memory.tasks||[];
+              memory.tasks.push(nt);
+              _logAction('ADD_REMINDER',{text:r.title,deadline:taskDeadline,isReminder:true},nt.id);
+            }
+          }
+        }
       }
       cursor.setDate(cursor.getDate()+1);
     }
@@ -3323,7 +3408,16 @@ function toggleJournalMic(){
 function updateHistoryUI(){
   const el=document.getElementById('history-content');if(!el)return;
   const msgs=memory.conversations.slice().reverse().slice(0,50);
-  el.innerHTML=msgs.length>0?msgs.map(m=>`<div class="msg ${m.role==='assistant'?'gillian':'user'}"><div class="msg-label">${m.role==='assistant'?'GILLIAN':'YOU'} · ${new Date(m.ts||Date.now()).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'})}</div><div class="msg-content">${esc(cleanDisplay(m.content))}</div></div>`).join(''):'<div style="padding:40px;text-align:center;font-family:var(--font-mono);font-size:11px;color:rgba(165,180,252,0.75)">LOG IS EMPTY</div>';
+  const convHtml=msgs.length>0?msgs.map(m=>`<div class="msg ${m.role==='assistant'?'gillian':'user'}"><div class="msg-label">${m.role==='assistant'?'GILLIAN':'YOU'} · ${new Date(m.ts||Date.now()).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'})}</div><div class="msg-content">${esc(cleanDisplay(m.content))}</div></div>`).join(''):'';
+  const ledger=(memory.actionLog||[]).slice().reverse().slice(0,100);
+  const TYPE_ICONS={ADD_TASK:'📋',ADD_REMINDER:'🔔',SCHEDULE_ALARM:'⏰',ADD_CALENDAR_EVENT:'📅',ADD_RECURRING_EVENT:'🔁',SCHEDULE_DEBRIEF:'📊',LOG_BILL:'💸',ADD_JOURNAL_ENTRY:'📓'};
+  const ledgerHtml=ledger.length>0?`<div style="padding:10px 16px 4px;font-family:var(--font-mono);font-size:9px;color:rgba(165,180,252,0.5);letter-spacing:.08em;text-transform:uppercase">─── Action Ledger (${ledger.length}) ───</div>`+ledger.map(e=>{
+    const icon=TYPE_ICONS[e.type]||'⚡';
+    const statusColor=e.status==='VERIFIED'?'rgba(110,231,183,0.7)':e.status==='LOGGED'?'rgba(165,180,252,0.7)':'rgba(251,191,36,0.7)';
+    const label=e.payload?.text||e.payload?.title||e.payload?.label||e.payload?.alarmAt||e.type;
+    return`<div style="display:flex;align-items:center;gap:8px;padding:5px 16px;border-bottom:1px solid rgba(99,102,241,0.08)"><span style="font-size:12px">${icon}</span><div style="flex:1;min-width:0"><div style="font-family:var(--font-mono);font-size:9px;color:rgba(165,180,252,0.55)">${e.type} · ${new Date(e.ts).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'})}</div><div style="font-size:11px;color:rgba(224,231,255,0.85);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(String(label).slice(0,60))}</div></div><span style="font-family:var(--font-mono);font-size:8px;color:${statusColor}">${e.status}</span></div>`;
+  }).join(''):'';
+  el.innerHTML=(!convHtml&&!ledgerHtml)?'<div style="padding:40px;text-align:center;font-family:var(--font-mono);font-size:11px;color:rgba(165,180,252,0.75)">LOG IS EMPTY</div>':(ledgerHtml+convHtml);
 }
 
 
